@@ -1,1 +1,9 @@
 streamlit
+numpy
+soundfile
+librosa
+noisereduce
+scipy
+pyloudnorm
+pydub
+ffmpeg
