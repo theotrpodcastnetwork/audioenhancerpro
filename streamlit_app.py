@@ -2,55 +2,65 @@ import numpy as np
 import soundfile as sf
 import streamlit as st
 import librosa
-import librosa.display
 import noisereduce as nr
 from scipy.signal import butter, filtfilt, lfilter
 import pyloudnorm as pyln
-from pydub import AudioSegment
-import torch
+import webrtcvad
 
-# =============================================================================
-# Load Silero VAD model (cached to avoid reloading on every run)
-# =============================================================================
-@st.cache_resource
-def load_vad_model():
+# ------------------------------------------------------------------
+# WebRTC VAD Implementation
+# ------------------------------------------------------------------
+def frame_generator(frame_duration_ms, audio, sample_rate):
     """
-    Load the Silero VAD model and return the model along with the get_speech_timestamps function.
-    This function uses torch.hub to load the model from the repository.
+    Generates audio frames from a 1-D numpy array.
+    Each frame is of duration 'frame_duration_ms' milliseconds.
     """
-    model, utils = torch.hub.load("snakers4/silero-vad", "silero_vad", force_reload=True)
-    # utils is a tuple; the first element is the get_speech_timestamps function
-    get_speech_timestamps = utils[0]
-    return model, get_speech_timestamps
+    n_samples = int(sample_rate * frame_duration_ms / 1000)
+    offset = 0
+    while offset + n_samples <= len(audio):
+        yield audio[offset:offset + n_samples]
+        offset += n_samples
 
-def apply_vad(audio, sr, model, get_speech_timestamps):
+def apply_webrtc_vad(audio, sample_rate, frame_duration_ms=30, vad_mode=3):
     """
-    Apply Silero VAD to detect speech segments in the audio.
+    Apply WebRTC VAD to extract speech segments from audio.
     
     Parameters:
-        audio (np.array): 1D audio signal.
-        sr (int): Sampling rate of the audio.
-        model: Loaded Silero VAD model.
-        get_speech_timestamps: Function to obtain speech segments.
+        audio (np.array): A 1D numpy array containing float audio samples (range -1 to 1).
+        sample_rate (int): The sampling rate of the audio.
+        frame_duration_ms (int): Duration (in milliseconds) for each frame (10, 20, or 30 ms).
+        vad_mode (int): Aggressiveness of the VAD (0 is least, 3 is most aggressive).
         
     Returns:
-        np.array: Concatenated speech segments from the input audio.
+        np.array: Concatenated speech frames as a float32 numpy array (range -1 to 1).
     """
-    # Get timestamps for speech segments.
-    # Each element in speech_timestamps is a dictionary with keys 'start' and 'end' (sample indices).
-    speech_timestamps = get_speech_timestamps(audio, model, sampling_rate=sr)
+    # Convert float audio (range -1, 1) to 16-bit PCM (range -32768, 32767)
+    audio_int16 = (audio * 32767).astype(np.int16)
     
-    if len(speech_timestamps) == 0:
+    # Initialize WebRTC VAD and set its mode
+    vad = webrtcvad.Vad()
+    vad.set_mode(vad_mode)
+    
+    speech_frames = []
+    # Process the audio in frames
+    for frame in frame_generator(frame_duration_ms, audio_int16, sample_rate):
+        frame_bytes = frame.tobytes()
+        if vad.is_speech(frame_bytes, sample_rate):
+            speech_frames.append(frame)
+    
+    if not speech_frames:
         # If no speech is detected, return the original audio
         return audio
     
-    # Concatenate all detected speech segments into one array
-    speech_audio = np.concatenate([audio[segment['start']:segment['end']] for segment in speech_timestamps])
+    # Concatenate speech frames into one array
+    speech_audio_int16 = np.concatenate(speech_frames)
+    # Convert back to float32 in range -1 to 1
+    speech_audio = speech_audio_int16.astype(np.float32) / 32767.0
     return speech_audio
 
-# =============================================================================
-# Existing enhancement functions
-# =============================================================================
+# ------------------------------------------------------------------
+# Existing Audio Enhancement Functions
+# ------------------------------------------------------------------
 def reduce_noise(audio, sr):
     return nr.reduce_noise(y=audio, sr=sr)
 
@@ -69,51 +79,50 @@ def butter_lowpass_filter(data, cutoff, fs, order=5):
     return lfilter(b, a, data)
 
 def compress_audio(audio, sr):
-    meter = pyln.Meter(sr) 
+    meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(audio)
     return pyln.normalize.loudness(audio, loudness, -20.0)  # Target -20 LUFS
 
-# =============================================================================
-# Main audio enhancement pipeline with optional Silero VAD preprocessing
-# =============================================================================
+# ------------------------------------------------------------------
+# Main Audio Enhancement Pipeline
+# ------------------------------------------------------------------
 def enhance_audio(input_file, output_file, apply_vad_flag=False):
-    # Load audio with its original sampling rate
+    # Load audio using librosa (preserving the original sampling rate)
     audio, sr = librosa.load(input_file, sr=None)
     
-    # If enabled, apply Silero VAD to extract only the speech segments (trim silence/background)
+    # If enabled, apply WebRTC VAD to extract speech segments
     if apply_vad_flag:
-        model, get_speech_timestamps = load_vad_model()
-        audio = apply_vad(audio, sr, model, get_speech_timestamps)
+        audio = apply_webrtc_vad(audio, sr)
     
-    # Apply the enhancement processing steps:
+    # Apply the rest of the enhancement steps
     audio = reduce_noise(audio, sr)
     audio = parametric_eq(audio, sr)
     audio = butter_lowpass_filter(audio, cutoff=8000, fs=sr)
     audio = normalize_audio(audio)
     audio = compress_audio(audio, sr)
     
-    # Optionally, further trim any extra silence from the beginning or end
+    # Trim any extra silence from the beginning and end
     audio, _ = librosa.effects.trim(audio)
     
     # Save the enhanced audio as a 16-bit PCM WAV file
     sf.write(output_file, audio, sr, format='WAV', subtype='PCM_16')
-    print(f'Enhanced audio saved to {output_file}')
+    st.write(f'Enhanced audio saved to {output_file}')
 
-# =============================================================================
-# Streamlit app interface
-# =============================================================================
+# ------------------------------------------------------------------
+# Streamlit Interface
+# ------------------------------------------------------------------
 def main():
     st.title("Audio Enhancer Pro")
     uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "flac"])
     
-    # Checkbox to optionally apply Silero VAD for speech detection/trimming
-    apply_vad_flag = st.checkbox("Apply Silero VAD (Trim Silence / Extract Speech)", value=False)
+    # Checkbox to optionally apply WebRTC VAD for speech extraction
+    apply_vad_flag = st.checkbox("Apply WebRTC VAD (Extract Speech)", value=False)
     
     if uploaded_file is not None:
         input_file = "temp_input.wav"
         output_file = "enhanced_output.wav"
         
-        # Save the uploaded file to a temporary location
+        # Save the uploaded file temporarily
         with open(input_file, "wb") as f:
             f.write(uploaded_file.getbuffer())
         
