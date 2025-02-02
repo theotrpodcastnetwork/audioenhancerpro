@@ -8,25 +8,34 @@ from scipy.signal import butter, filtfilt, lfilter
 import pyloudnorm as pyln
 from pydub import AudioSegment
 
-def reduce_noise(audio, sr, prop_decrease=1.0):
+def reduce_noise(audio, sr, noise_duration=0.5, prop_decrease=1.0):
     """
-    Reduce noise using the noisereduce library.
+    Reduce background noise using noisereduce with a designated noise profile.
     
     Parameters:
         audio (np.array): Audio signal.
         sr (int): Sampling rate.
+        noise_duration (float): Duration (in seconds) of the noise sample extracted 
+                                from the beginning of the audio.
+                                Set to 0 to let noisereduce automatically estimate noise.
         prop_decrease (float): Controls the aggressiveness of noise reduction.
                                Lower values result in less aggressive reduction.
+                               
     Returns:
         np.array: Denoised audio signal.
     """
-    return nr.reduce_noise(y=audio, sr=sr, prop_decrease=prop_decrease)
+    if noise_duration > 0:
+        # Extract a noise clip from the beginning of the audio
+        n_samples = int(noise_duration * sr)
+        noise_clip = audio[:n_samples]
+        return nr.reduce_noise(y=audio, sr=sr, y_noise=noise_clip, prop_decrease=prop_decrease)
+    else:
+        # Use automatic noise estimation if no noise sample is provided
+        return nr.reduce_noise(y=audio, sr=sr, prop_decrease=prop_decrease)
 
 def parametric_eq(audio, sr, f0=1500, Q=1.0, gain_db=6.0):
     """
-    Applies a peaking (bell) filter to boost midrange frequencies.
-    
-    This filter boosts frequencies around f0 (default 1500 Hz) without cutting out high frequencies.
+    Apply a peaking (bell) filter to boost midrange frequencies without attenuating high frequencies.
     
     Parameters:
         audio (np.array): Audio signal.
@@ -38,8 +47,7 @@ def parametric_eq(audio, sr, f0=1500, Q=1.0, gain_db=6.0):
     Returns:
         np.array: Equalized audio signal.
     """
-    # Calculate filter coefficients based on the Audio EQ Cookbook formulas
-    A = 10**(gain_db / 40)  # A = sqrt(10^(gain/20))
+    A = 10 ** (gain_db / 40)  # amplitude scaling factor
     omega = 2 * np.pi * f0 / sr
     alpha = np.sin(omega) / (2 * Q)
     
@@ -50,20 +58,19 @@ def parametric_eq(audio, sr, f0=1500, Q=1.0, gain_db=6.0):
     a1 = -2 * np.cos(omega)
     a2 = 1 - alpha / A
     
-    # Normalize the coefficients
+    # Normalize filter coefficients
     b = np.array([b0, b1, b2]) / a0
     a = np.array([1, a1 / a0, a2 / a0])
     
-    # Apply the filter using zero-phase filtering (filtfilt)
     return filtfilt(b, a, audio)
 
 def normalize_audio(audio):
-    """Normalize audio so its maximum absolute amplitude is 1."""
+    """Normalize audio so that its maximum absolute amplitude is 1."""
     return audio / np.max(np.abs(audio))
 
 def butter_lowpass_filter(data, cutoff, fs, order=5):
     """
-    Apply a Butterworth low-pass filter.
+    Apply a Butterworth low-pass filter to remove excessive high-frequency noise.
     
     Parameters:
         data (np.array): Audio signal.
@@ -81,7 +88,7 @@ def butter_lowpass_filter(data, cutoff, fs, order=5):
 
 def compress_audio(audio, sr):
     """
-    Compress (normalize) audio to a target loudness of -20 LUFS.
+    Compress (loudness-normalize) audio to a target of -20 LUFS using pyloudnorm.
     
     Parameters:
         audio (np.array): Audio signal.
@@ -90,33 +97,40 @@ def compress_audio(audio, sr):
     Returns:
         np.array: Loudness-normalized audio signal.
     """
-    meter = pyln.Meter(sr) 
+    meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(audio)
     return pyln.normalize.loudness(audio, loudness, -20.0)  # Target -20 LUFS
 
-def enhance_audio(input_file, output_file, cutoff=12000, noise_prop=1.0, eq_gain=6.0):
+def enhance_audio(input_file, output_file, cutoff=12000, noise_prop=1.0, eq_gain=6.0, noise_duration=0.5):
     """
-    Enhance the input audio by applying noise reduction, EQ, low-pass filtering,
-    normalization, compression, and trimming.
+    Enhance the input audio by applying background noise reduction, EQ, low-pass filtering,
+    normalization, loudness compression, and silence trimming.
     
     Parameters:
         input_file (str): Path to the input audio file.
-        output_file (str): Path for the output enhanced audio.
-        cutoff (float): Low-pass filter cutoff frequency in Hz.
-        noise_prop (float): Aggressiveness of noise reduction.
-        eq_gain (float): Midrange boost gain in dB.
+        output_file (str): Path to save the enhanced audio.
+        cutoff (float): Low-pass filter cutoff frequency (Hz).
+        noise_prop (float): Aggressiveness of the noise reduction.
+        eq_gain (float): Gain (in dB) for the midrange EQ boost.
+        noise_duration (float): Duration (in seconds) to sample for background noise.
     """
-    # Load audio using its original sampling rate
+    # Load the audio file using its original sampling rate
     audio, sr = librosa.load(input_file, sr=None)
     
-    # Apply processing steps:
-    audio = reduce_noise(audio, sr, prop_decrease=noise_prop)
-    audio = parametric_eq(audio, sr, gain_db=eq_gain)  # Boost midrange without cutting high frequencies
+    # Apply background noise reduction with a noise sample
+    audio = reduce_noise(audio, sr, noise_duration=noise_duration, prop_decrease=noise_prop)
+    
+    # Apply midrange EQ boost without attenuating high frequencies
+    audio = parametric_eq(audio, sr, gain_db=eq_gain)
+    
+    # Apply low-pass filtering to remove excessive high-frequency noise
     audio = butter_lowpass_filter(audio, cutoff=cutoff, fs=sr)
+    
+    # Normalize and compress the audio for consistent loudness
     audio = normalize_audio(audio)
     audio = compress_audio(audio, sr)
     
-    # Trim extra silence from beginning and end
+    # Trim extra silence from the beginning and end
     audio, _ = librosa.effects.trim(audio)
     
     # Save the enhanced audio as a 16-bit PCM WAV file
@@ -127,13 +141,16 @@ def main():
     st.title("Audio Enhancer Pro")
     uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "flac"])
     
-    # Allow user to adjust parameters
-    cutoff = st.slider("Select low-pass filter cutoff frequency (Hz)", 
+    # Parameter controls
+    cutoff = st.slider("Low-Pass Filter Cutoff Frequency (Hz)", 
                        min_value=8000, max_value=20000, value=12000, step=500)
     noise_prop = st.slider("Noise Reduction Aggressiveness (0.1 = low, 1.0 = high)", 
                            min_value=0.1, max_value=1.0, value=0.8, step=0.1)
     eq_gain = st.slider("Midrange EQ Boost (dB)", 
                         min_value=0.0, max_value=12.0, value=6.0, step=0.5)
+    noise_duration = st.number_input("Noise Sample Duration (seconds)", 
+                                     min_value=0.0, max_value=5.0, value=0.5, step=0.1,
+                                     help="Duration from the start of the audio used to sample background noise.")
     
     if uploaded_file is not None:
         input_file = "temp_input.wav"
@@ -146,7 +163,8 @@ def main():
         st.audio(input_file, format="audio/wav")
         
         if st.button("Enhance Audio"):
-            enhance_audio(input_file, output_file, cutoff=cutoff, noise_prop=noise_prop, eq_gain=eq_gain)
+            enhance_audio(input_file, output_file, cutoff=cutoff, noise_prop=noise_prop, 
+                          eq_gain=eq_gain, noise_duration=noise_duration)
             st.success("Audio enhancement complete!")
             st.audio(output_file, format="audio/wav")
 
